@@ -173,6 +173,101 @@ or
         elif layout.parameter("__array__") in ("string", "bytestring"):
             return [(ak.operations.to_numpy(layout), row_arrays, col_names)]
 
+        elif layout.is_option and layout.purelist_depth == 2 and len(row_arrays) == 0:
+            # Special handling for TOP-LEVEL option types containing single-level nested lists (option[var * T]).
+            # When None or empty lists appear, we need to ensure at least one row
+            # is created per entry for proper merging with non-nested fields.
+            # Only apply at top level (len(row_arrays) == 0) to avoid interfering with deeper nesting.
+            # Note: purelist_depth==2 means option[var * T] where T has purelist_depth 1.
+
+            # Get the mask indicating which entries are None
+            mask_index = ak.operations.is_none(layout, highlevel=False)
+
+            # Project out the option to get the nested list content
+            projected = layout.project()
+
+            # Process the projected content through normal nested list logic
+            offsets, flattened = projected._offsets_and_flattened(axis=1, depth=1)
+            starts, stops = offsets.data[:-1], offsets.data[1:]
+            counts = stops - starts
+            if ak._util.win or ak._util.bits32:
+                counts = layout.backend.nplike.astype(counts, np.int32)
+
+            # For entries with None (not in projected), set count to 1 to create a row
+            # We need to adjust counts to include the None entries
+            full_counts = numpy.zeros(len(layout), dtype=counts.dtype)
+
+            # Convert mask to numpy boolean array
+            mask_array = numpy.asarray(ak.operations.to_numpy(mask_index), dtype=bool)
+
+            # Map the projected counts back to the full array
+            valid_indices = ~mask_array
+            full_counts[valid_indices] = counts
+
+            # For entries with None, set count to 1 so they get a row
+            full_counts[mask_array] = 1
+            none_indices = mask_array
+
+            # Create row arrays based on full counts
+            if len(row_arrays) == 0:
+                newrows = [
+                    numpy.repeat(numpy.arange(len(full_counts), dtype=full_counts.dtype), full_counts)
+                ]
+            else:
+                newrows = [numpy.repeat(x, full_counts) for x in row_arrays]
+
+            # For subentry indices, we need to handle None entries specially
+            subentry_indices = []
+            for i, count in enumerate(full_counts):
+                if none_indices[i]:
+                    # None entry gets subentry index 0
+                    subentry_indices.append(0)
+                else:
+                    # Normal entries get their range of indices
+                    subentry_indices.extend(range(count))
+
+            newrows.append(numpy.asarray(subentry_indices, dtype=full_counts.dtype))
+
+            # Create the data column with NaN for None entries
+            # First, convert flattened to numpy and create an array of the right length
+            flat_numpy = ak.operations.to_numpy(flattened)
+            total_rows = numpy.sum(full_counts)
+
+            # Map flattened data to the correct positions
+            if np.issubdtype(flat_numpy.dtype, np.floating):
+                column_data = numpy.full(total_rows, np.nan, dtype=flat_numpy.dtype)
+            elif np.issubdtype(flat_numpy.dtype, np.str_):
+                # Ensure dtype is wide enough for "nan" (3 characters)
+                char_width = flat_numpy.dtype.itemsize // 4
+                if char_width < 3:
+                    target_dtype = np.dtype(("U", 3))
+                else:
+                    target_dtype = flat_numpy.dtype
+                column_data = numpy.full(total_rows, "nan", dtype=target_dtype)
+            elif np.issubdtype(flat_numpy.dtype, np.bytes_):
+                # Ensure dtype is wide enough for b"nan" (3 bytes)
+                byte_width = flat_numpy.dtype.itemsize
+                if byte_width < 3:
+                    target_dtype = np.dtype(("S", 3))
+                else:
+                    target_dtype = flat_numpy.dtype
+                column_data = numpy.full(total_rows, b"nan", dtype=target_dtype)
+            else:
+                # For other types, create a masked array
+                column_data = numpy.ma.masked_all(total_rows, dtype=flat_numpy.dtype)
+
+            # Fill in the valid (non-None) data
+            data_position = 0
+            row_position = 0
+            for i, count in enumerate(full_counts):
+                if not none_indices[i]:
+                    # Copy the data for this entry
+                    column_data[row_position:row_position + count] = flat_numpy[data_position:data_position + count]
+                    data_position += count
+                row_position += count
+
+            return [(column_data, newrows, col_names)]
+
         elif layout.purelist_depth > 1:
             offsets, flattened = layout._offsets_and_flattened(axis=1, depth=1)
             starts, stops = offsets.data[:-1], offsets.data[1:]
